@@ -1,0 +1,125 @@
+import streamlit as st
+import torch
+import torch.nn as nn
+from torchvision import models, transforms
+from torchvision.models import DenseNet121_Weights, DenseNet169_Weights
+from PIL import Image
+import numpy as np
+import cv2
+from ultralytics import YOLO
+
+# =====================
+# 🔹 Load Models
+# =====================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Colonoscopy YOLO model (polyp detection)
+yolo_model = YOLO(r"C:\Users\rishw\OneDrive\Desktop\datasets\polyp_yolo5\weights\best.pt")
+
+# Colonoscopy DenseNet (classification)
+col_model = models.densenet169(weights=DenseNet169_Weights.IMAGENET1K_V1)
+col_model.classifier = nn.Linear(col_model.classifier.in_features, 2)  # hyperplastic / adenomatous
+col_model.load_state_dict(torch.load(r"C:\Users\rishw\OneDrive\Desktop\datasets\PolypsSet\densenet169_polyp.pth", map_location=device))
+col_model = col_model.to(device).eval()
+col_class_names = ["hyperplastic", "adenomatous"]
+
+# Histopathology DenseNet (stage classification)
+hist_model = models.densenet121(weights=DenseNet121_Weights.IMAGENET1K_V1)
+hist_model.classifier = nn.Linear(hist_model.classifier.in_features, 4)  # 4 stages
+hist_model.load_state_dict(torch.load(r"C:\Users\rishw\OneDrive\Desktop\datasets\Histopathology_Split\best_densenet121_stage.pth", map_location=device))
+hist_model = hist_model.to(device).eval()
+hist_class_names =  ["Not_specified", "Stage_I", "Stage_II", "Stage_IIA", "Stage_IIB", "Stage_III", "Stage_IIIA", "Stage_IIIB", "Stage_IIIC", "Stage_IV"]
+
+# =====================
+# 🔹 Preprocessing
+# =====================
+eval_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+# =====================
+# 🔹 Prediction Functions
+# =====================
+def predict_colonoscopy(img: Image.Image):
+    # Run YOLO detection
+    results = yolo_model.predict(img, imgsz=640, conf=0.25, save=False)
+    boxes = results[0].boxes.xyxy.cpu().numpy().astype(int)
+
+    img_cv = np.array(img)
+    img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2BGR)
+
+    predictions = []
+    for (x1, y1, x2, y2) in boxes:
+        crop = img.crop((x1, y1, x2, y2))
+        crop_tensor = eval_transform(crop).unsqueeze(0).to(device)
+        with torch.no_grad():
+            outputs = col_model(crop_tensor)
+            probs = torch.softmax(outputs, dim=1)
+            conf, pred_class = torch.max(probs, 1)
+
+        label = col_class_names[pred_class.item()]
+        confidence = conf.item() * 100
+        predictions.append((label, confidence))
+
+        # Draw box
+        cv2.rectangle(img_cv, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(img_cv, f"{label} {confidence:.1f}%", (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+    return cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB), predictions
+
+
+def predict_histopathology(img: Image.Image):
+    img_tensor = eval_transform(img).unsqueeze(0).to(device)
+    with torch.no_grad():
+        outputs = hist_model(img_tensor)
+        probs = torch.softmax(outputs, dim=1)
+        conf, pred_class = torch.max(probs, 1)
+
+    return hist_class_names[pred_class.item()], conf.item() * 100
+
+
+# =====================
+# 🔹 Streamlit UI
+# =====================
+st.title("🩺 AI for Polyp Detection & Cancer Staging")
+
+# Home Page
+page = st.sidebar.radio("Select Image Type", ["Home", "Colonoscopy", "Histopathology"])
+
+if page == "Home":
+    st.write("### Welcome! 👋")
+    st.write("Select **Colonoscopy** or **Histopathology** from the sidebar to continue.")
+
+elif page == "Colonoscopy":
+    st.header("🔎 Colonoscopy Analysis (YOLO + DenseNet)")
+    uploaded_file = st.file_uploader("Upload Colonoscopy Image", type=["jpg", "png", "jpeg"])
+    if uploaded_file:
+        img = Image.open(uploaded_file).convert("RGB")
+        st.image(img, caption="Uploaded Image", use_column_width=True)
+
+        if st.button("Run Analysis"):
+            output_img, preds = predict_colonoscopy(img)
+            st.image(output_img, caption="Detection + Classification", use_column_width=True)
+            st.write("### Predictions:")
+            for i, (label, conf) in enumerate(preds):
+                st.write(f"Polyp {i+1}: **{label}** ({conf:.2f}%)")
+
+    if st.button("⬅️ Return Home"):
+        st.experimental_rerun()
+
+elif page == "Histopathology":
+    st.header("🧬 Histopathology Stage Classification (DenseNet121)")
+    uploaded_file = st.file_uploader("Upload Histopathology Image", type=["jpg", "png", "jpeg"])
+    if uploaded_file:
+        img = Image.open(uploaded_file).convert("RGB")
+        st.image(img, caption="Uploaded Image", use_column_width=True)
+
+        if st.button("Run Stage Prediction"):
+            label, conf = predict_histopathology(img)
+            st.success(f"Predicted Stage: **{label}** ({conf:.2f}%)")
+
+    if st.button("⬅️ Return Home"):
+        st.experimental_rerun()
